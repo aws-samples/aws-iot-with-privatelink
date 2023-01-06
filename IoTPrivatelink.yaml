@@ -1,0 +1,559 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: An AWS cloudformation template for simple iot device simulator
+Transform: 'AWS::Serverless-2016-10-31'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+  AvaibilityZone1:
+    Type: String
+    Default: us-east-1a
+  AvaibilityZone2:
+    Type: String
+    Default: us-east-1b
+  UserName:
+    Type: String
+    Default: developer
+  Var1:
+    Type: String
+    Default: ""
+  Var2:
+    Type: String
+    Default: ""
+
+Mappings:
+  SubnetConfig:
+    VPCB:
+      CIDR: 10.0.0.0/16
+    SubnetB:
+      CIDR: 10.0.0.0/24
+    VPCA:
+      CIDR: 10.1.0.0/16
+    SubnetPublicA:
+      CIDR: 10.1.1.0/24    
+    SubnetPrivateA:
+      CIDR: 10.1.2.0/24    
+  EC2InstanceConfig:
+    InstanceType: 
+      Experiment: t2.micro
+    ImageId: 
+      Experiment: ami-0a8b4cd432b1c3063
+
+Resources: 
+  AccessKey:
+    Type: AWS::IAM::AccessKey
+    Properties: 
+      UserName: !Sub ${UserName}
+
+  AccessKeySecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub AccessKey-${Environment}
+      Description: IoT Privatelink Access Key
+      SecretString: !Sub '{"AccessKeyId":"${AccessKey}","SecretAccessKey":"${AccessKey.SecretAccessKey}"}'
+
+  KmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: CDF encryption key
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Id: key-default-1
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS:
+                - !Sub "arn:aws:iam::${AWS::AccountId}:root"
+                - !Sub "arn:aws:iam::${AWS::AccountId}:user/${UserName}"
+            Action:
+              - kms:*
+            Resource: "*"
+
+  KeyPair:
+    Type: 'AWS::EC2::KeyPair'
+    Properties:
+      KeyName: EC2KeyPair
+
+  VPCA:
+    Type: AWS::EC2::VPC
+    Properties:
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      CidrBlock: 
+        Fn::FindInMap:
+        - SubnetConfig
+        - VPCA
+        - CIDR
+
+  SubnetPublicA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPCA
+      CidrBlock: 
+        Fn::FindInMap:
+        - SubnetConfig
+        - SubnetPublicA
+        - CIDR
+      MapPublicIpOnLaunch: true 
+      AvailabilityZone: !Sub ${AvaibilityZone1}
+
+  SubnetPrivateA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPCA
+      CidrBlock: 
+        Fn::FindInMap:
+        - SubnetConfig
+        - SubnetPrivateA
+        - CIDR
+      MapPublicIpOnLaunch: false 
+      AvailabilityZone: !Sub ${AvaibilityZone2}
+  
+  InternetGatewayA:
+    Type: AWS::EC2::InternetGateway
+  
+  VPCGatewayAttachmentA:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+        VpcId: !Ref VPCA
+        InternetGatewayId: !Ref InternetGatewayA
+
+  RouteTablePublicA:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPCA 
+  
+  PublicInternetRouteA:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachmentA
+    Properties:
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGatewayA
+      RouteTableId: !Ref RouteTablePublicA
+  
+  PublicSubnetRouteTableAssociationA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref RouteTablePublicA
+      SubnetId: !Ref SubnetPublicA
+
+  ## NAT GATEWAY
+  NatGatewayA:
+    Type: AWS::EC2::NatGateway
+    DependsOn: NatPublicIPA
+    Properties: 
+      SubnetId: !Ref SubnetPublicA
+      AllocationId: !GetAtt NatPublicIPA.AllocationId
+
+  ## ELASTIC IP
+  NatPublicIPA:
+    Type: AWS::EC2::EIP
+    DependsOn: VPCA
+    Properties:
+      Domain: vpc
+     
+  ## PRIVATE ROUTING
+  RouteTablePrivateA:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPCA
+      
+  PrivateRouteA:
+    Type: AWS::EC2::Route
+    Properties:
+      NatGatewayId: !Ref NatGatewayA
+      RouteTableId: !Ref RouteTablePrivateA
+      DestinationCidrBlock: 0.0.0.0/0
+
+  PrivateSubnetRouteTableAssociationA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref SubnetPrivateA
+      RouteTableId: !Ref RouteTablePrivateA
+
+  IOTSimA:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: 
+        Fn::FindInMap:
+        - EC2InstanceConfig
+        - InstanceType
+        - Experiment
+      ImageId:
+        Fn::FindInMap:
+        - EC2InstanceConfig
+        - ImageId
+        - Experiment
+      KeyName: !Ref KeyPair
+      SubnetId: !Ref SubnetPublicA
+      SecurityGroupIds:
+      - Ref: SecurityGroupA
+      Tags:
+        - Key: Name
+          Value: IOT-Sim-A
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -ex
+          sudo yum update -y
+          sudo yum install git -y
+          sudo yum install jq -y
+          curl -sL https://rpm.nodesource.com/setup_16.x | sudo bash -
+          sudo yum install -y nodejs
+          aws configure set aws_access_key_id ${AccessKey}
+          aws configure set aws_secret_access_key ${AccessKey.SecretAccessKey}
+          aws configure set default.region ${AWS::Region}
+          aws iot create-thing --thing-name "MyIotThingA"
+          mkdir ~/certs
+          sudo su
+          curl -o ~/certs/Amazon-root-CA-1.pem https://www.amazontrust.com/repository/AmazonRootCA1.pem 
+          Var1=$(aws iot create-keys-and-certificate --set-as-active --certificate-pem-outfile "~/certs/device.pem.crt" --public-key-outfile "~/certs/public.pem.key" --private-key-outfile "~/certs/private.pem.key")
+          Certificate_Arn=$( jq -r  '.certificateArn' <<< $Var1 )
+          aws iot attach-thing-principal --thing-name "MyIotThingA" --principal $Certificate_Arn
+          aws iot attach-policy --policy-name ${IoTPolicy} --target $Certificate_Arn
+          cd ~
+          git clone https://github.com/aws/aws-iot-device-sdk-js-v2.git
+          cd aws-iot-device-sdk-js-v2
+          npm install
+          cd ~/aws-iot-device-sdk-js-v2/samples/node/pub_sub
+          npm install
+          Var2=$(aws iot describe-endpoint --endpoint-type iot:Data-ATS)
+          Endpoint_Address=$( jq -r  '.endpointAddress' <<< $Var2 )
+          node dist/index.js --topic topic_A --root-ca ~/certs/Amazon-root-CA-1.pem --cert ~/certs/device.pem.crt --key ~/certs/private.pem.key --endpoint $Endpoint_Address
+
+  SecurityGroupA:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Allow SSH traffic in, all trafic out"
+      VpcId: !Ref VPCA
+      # The incoming traffic
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: '22'
+          ToPort: '22'
+          # The range of ip address to allow traffic from
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: '80'
+          ToPort: '80'
+          # The range of ip address to allow traffic from
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: '443'
+          ToPort: '443'
+          # The range of ip address to allow traffic from
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: '8883'
+          ToPort: '8883'
+          # The range of ip address to allow traffic from
+          CidrIp: 0.0.0.0/0
+
+  IOTInterfaceEndpoint:
+    Type: 'AWS::EC2::VPCEndpoint'
+    Properties:
+      VpcEndpointType: Interface
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.iot.data'
+      VpcId: !Ref VPCA
+      SubnetIds: 
+        - !Ref SubnetPrivateA
+      SecurityGroupIds:
+        - !Ref SecurityGroupA
+  
+  IOTPrivateHostedZone: 
+    Type: "AWS::Route53::HostedZone"
+    Properties: 
+      HostedZoneConfig: 
+        Comment: 'IOT data private hosted zone'
+      Name: !Sub 'iot.${AWS::Region}.amazonaws.com'
+      VPCs:     
+        - VPCId: !Ref VPCA
+          VPCRegion: !Ref 'AWS::Region'      
+
+  IOTEndpointRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref IOTPrivateHostedZone
+      Comment: CNAME record for IOT endpoints
+      Name: !GetAtt IotEndpoint.IotEndpointAddress
+      Type: CNAME
+      TTL: '5'
+      SetIdentifier: Frontend One
+      Weight: '4'
+      ResourceRecords:
+        - Fn::Select: [1, {Fn::Split: [":", {Fn::Select: [0, {Fn::GetAtt: [IOTInterfaceEndpoint, DnsEntries]}]}]}]
+
+  IoTPolicy:
+    Type: 'AWS::IoT::Policy'
+    Properties:
+      PolicyName: !Sub IotPrivateLinkThingPolicy-${Environment}
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'iot:Publish'
+              - 'iot:Subscribe'
+              - 'iot:Receive'
+              - 'iot:Connect'
+            Resource: '*'     
+
+
+  VPCB:
+    Type: AWS::EC2::VPC
+    Properties:
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      CidrBlock: 
+        Fn::FindInMap:
+        - SubnetConfig
+        - VPCB
+        - CIDR
+  
+  SubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPCB
+      CidrBlock: 
+        Fn::FindInMap:
+        - SubnetConfig
+        - SubnetB
+        - CIDR
+      MapPublicIpOnLaunch: true 
+      AvailabilityZone: !Sub ${AvaibilityZone1}
+  
+  InternetGatewayB:
+    Type: AWS::EC2::InternetGateway
+  
+  VPCGatewayAttachmentB:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+        VpcId: !Ref VPCB
+        InternetGatewayId: !Ref InternetGatewayB
+
+  RouteTableB:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPCB 
+  
+  InternetRouteB:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachmentB
+    Properties:
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGatewayB
+      RouteTableId: !Ref RouteTableB
+  
+  SubnetRouteTableAssociationB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref RouteTableB
+      SubnetId: !Ref SubnetB
+  
+  SecurityGroupB:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Allow SSH traffic in, all trafic out"
+      VpcId: !Ref VPCB
+      # The incoming traffic
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: '22'
+          ToPort: '22'
+          # The range of ip address to allow traffic from
+          CidrIp: 0.0.0.0/0
+  
+
+
+  IOTSimB:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: 
+        Fn::FindInMap:
+        - EC2InstanceConfig
+        - InstanceType
+        - Experiment
+      ImageId:
+        Fn::FindInMap:
+        - EC2InstanceConfig
+        - ImageId
+        - Experiment
+      KeyName: !Ref KeyPair
+      SubnetId: !Ref SubnetB
+      SecurityGroupIds:
+      - Ref: SecurityGroupB
+      Tags:
+        - Key: Name
+          Value: IOT-Sim-B
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -ex
+          sudo yum update -y
+          sudo yum install git -y
+          sudo yum install jq -y
+          curl -sL https://rpm.nodesource.com/setup_16.x | sudo bash -
+          sudo yum install -y nodejs
+          aws configure set aws_access_key_id ${AccessKey}
+          aws configure set aws_secret_access_key ${AccessKey.SecretAccessKey}
+          aws configure set default.region ${AWS::Region}
+          aws iot create-thing --thing-name "MyIotThingB"
+          mkdir ~/certs
+          sudo su
+          curl -o ~/certs/Amazon-root-CA-1.pem https://www.amazontrust.com/repository/AmazonRootCA1.pem 
+          Var1=$(aws iot create-keys-and-certificate --set-as-active --certificate-pem-outfile "~/certs/device.pem.crt" --public-key-outfile "~/certs/public.pem.key" --private-key-outfile "~/certs/private.pem.key")
+          Certificate_Arn=$( jq -r  '.certificateArn' <<< $Var1 )
+          aws iot attach-thing-principal --thing-name "MyIotThingB" --principal $Certificate_Arn
+          aws iot attach-policy --policy-name ${IoTPolicy} --target $Certificate_Arn
+          cd ~
+          git clone https://github.com/aws/aws-iot-device-sdk-js-v2.git
+          cd aws-iot-device-sdk-js-v2
+          npm install
+          cd ~/aws-iot-device-sdk-js-v2/samples/node/pub_sub
+          npm install
+          Var2=$(aws iot describe-endpoint --endpoint-type iot:Data-ATS)
+          Endpoint_Address=$( jq -r  '.endpointAddress' <<< $Var2 )
+          node dist/index.js --topic topic_B --root-ca ~/certs/Amazon-root-CA-1.pem --cert ~/certs/device.pem.crt --key ~/certs/private.pem.key --endpoint $Endpoint_Address
+
+  IoTEC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - ec2.amazonaws.com
+          Action: sts:AssumeRole
+      Policies:
+      - PolicyName: aws-iot-access
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: "Allow"
+            Action:
+            - "iot:*"
+            Resource:
+            - "*"
+  
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: "/"
+      Roles:
+      - !Ref IoTEC2Role
+      InstanceProfileName: !Sub EC2InstanceProfile-${Environment}
+
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+            - Effect: Allow
+              Action:
+                - iot:DescribeEndpoint
+              Resource:
+                - '*'
+
+  IotEndpointProvider:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: IotEndpointProvider
+      Handler: index.handler
+      Runtime: nodejs16.x
+      MemorySize: 128
+      Timeout: 5
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: !Sub |
+          var aws = require("aws-sdk");
+          exports.handler = function(event, context) {
+              console.log("REQUEST RECEIVED:\n" + JSON.stringify(event));
+              // For Delete requests, immediately send a SUCCESS response.
+              if (event.RequestType == "Delete") {
+                  sendResponse(event, context, "SUCCESS");
+                  return;
+              }
+              const iot = new aws.Iot();
+              iot.describeEndpoint({}, (err, data) => {
+              let responseData, responseStatus;
+                  if (err) {
+                      responseStatus = "FAILED";
+                      responseData = { Error: "describeEndpoint call failed" };
+                      console.log(responseData.Error + ":\n", err);
+                  } else  {
+                      responseStatus = "SUCCESS";
+                      responseData = { IotEndpointAddress: data.endpointAddress };
+                      console.log('response data: ' + JSON.stringify(responseData));
+                  }
+                  sendResponse(event, context, responseStatus, responseData);
+              });
+          };
+          // Send response to the pre-signed S3 URL
+          function sendResponse(event, context, responseStatus, responseData) {
+              var responseBody = JSON.stringify({
+                  Status: responseStatus,
+                  Reason: "See the details in CloudWatch Log Stream: " + context.logStreamName,
+                  PhysicalResourceId: context.logStreamName,
+                  StackId: event.StackId,
+                  RequestId: event.RequestId,
+                  LogicalResourceId: event.LogicalResourceId,
+                  Data: responseData
+              });
+              console.log("RESPONSE BODY:\n", responseBody);
+              var https = require("https");
+              var url = require("url");
+              var parsedUrl = url.parse(event.ResponseURL);
+              var options = {
+                  hostname: parsedUrl.hostname,
+                  port: 443,
+                  path: parsedUrl.path,
+                  method: "PUT",
+                  headers: {
+                      "content-type": "",
+                      "content-length": responseBody.length
+                  }
+              };
+              console.log("SENDING RESPONSE...\n");
+              var request = https.request(options, function(response) {
+                  console.log("STATUS: " + response.statusCode);
+                  console.log("HEADERS: " + JSON.stringify(response.headers));
+                  // Tell AWS Lambda that the function execution is done
+                  context.done();
+              });
+              request.on("error", function(error) {
+                  console.log("sendResponse Error:" + error);
+                  // Tell AWS Lambda that the function execution is done
+                  context.done();
+              });
+              // write data to request body
+              request.write(responseBody);
+              request.end();
+          }
+  IotEndpoint:
+    Type: 'Custom::IotEndpoint'
+    DependsOn: IotEndpointProvider
+    Properties:
+      ServiceToken: !GetAtt IotEndpointProvider.Arn
+
+Outputs:
+  IotEndpointAddress:
+    Value: !GetAtt IotEndpoint.IotEndpointAddress
+    Export:
+      Name: IotEndpointAddress
